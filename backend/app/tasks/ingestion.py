@@ -3,17 +3,16 @@ Celery task: orchestrates the full repo ingestion pipeline.
 Publishes progress events to Redis for WebSocket streaming.
 """
 import json
-import redis as redis_lib
 
-from celery import current_task
 from sqlalchemy.orm import Session
 
 from app.core.celery_app import celery_app
 from app.core.config import get_settings
 from app.core.database import SessionLocal
+from app.core.redis_client import get_redis_client
 from app.models.models import Repository, CodeFile, CodeSymbol, ImportDependency, IngestionStatus, SymbolKind
 from app.services.ast_parser import PythonASTParser, RepoWalker
-from app.services.github_service import clone_repo, fetch_repo_metadata
+from app.services.github_service import clone_repo
 from app.services.embedding_service import embed_symbols
 from app.services.dependency_resolver import resolve_internal_dependency
 
@@ -29,7 +28,7 @@ def publish_progress(redis_client, repo_id: str, stage: str, message: str, pct: 
 @celery_app.task(bind=True, name="tasks.ingest_repository")
 def ingest_repository(self, repository_id: str):
     db: Session = SessionLocal()
-    r = redis_lib.from_url(settings.redis_url)
+    r = get_redis_client()
 
     def progress(stage: str, message: str, pct: int):
         publish_progress(r, repository_id, stage, message, pct)
@@ -57,24 +56,30 @@ def ingest_repository(self, repository_id: str):
         progress("parsing", f"Found {len(file_paths)} source files, parsing AST…", 25)
 
         parser = PythonASTParser()
-        all_symbols_with_paths = []
-        file_id_map = {}   # relative_path -> CodeFile.id
+        all_symbols_with_paths = []   # (ParsedSymbol, normalized_path, CodeFile.id)
+        file_id_map = {}              # normalized_path (forward slashes) -> CodeFile.id
+        file_imports_map = {}         # normalized_path -> list[ParsedImport]
 
         for i, fp in enumerate(file_paths):
             parsed = parser.parse(fp, local_path)
             if parsed.error:
                 continue
 
+            # Normalize to forward slashes so import resolution works
+            # consistently on Windows (os.path.relpath uses backslashes there).
+            normalized_path = parsed.path.replace("\\", "/")
+
             cf = CodeFile(
                 repository_id=repository_id,
-                path=parsed.path,
+                path=normalized_path,
                 language=parsed.language,
                 size_bytes=parsed.size_bytes,
                 line_count=parsed.line_count,
             )
             db.add(cf)
             db.flush()  # get cf.id without full commit
-            file_id_map[parsed.path] = cf.id
+            file_id_map[normalized_path] = cf.id
+            file_imports_map[normalized_path] = parsed.imports
 
             for sym in parsed.symbols:
                 kind_map = {"function": SymbolKind.FUNCTION, "class": SymbolKind.CLASS,
@@ -92,10 +97,7 @@ def ingest_repository(self, repository_id: str):
                     extra=sym.extra,
                 )
                 db.add(cs)
-                all_symbols_with_paths.append((sym, parsed.path, cf.id))
-
-            # Store imports temporarily for dependency resolution
-            cf._parsed_imports = parsed.imports
+                all_symbols_with_paths.append((sym, normalized_path, cf.id))
 
             if i % 50 == 0:
                 pct = 25 + int((i / len(file_paths)) * 25)
@@ -106,19 +108,15 @@ def ingest_repository(self, repository_id: str):
         # ── Stage 3: Dependency graph ─────────────────────────────────────
         progress("parsing", "Building dependency graph…", 52)
 
-        for fp in file_paths:
-            parsed = parser.parse(fp, local_path)
-            if parsed.error or not hasattr(parsed, '_parsed_imports'):
-                continue
-            source_relative = parsed.path
-            source_id = file_id_map.get(source_relative)
+        all_paths = list(file_id_map.keys())
+
+        for source_path, imports in file_imports_map.items():
+            source_id = file_id_map.get(source_path)
             if not source_id:
                 continue
 
-            for imp in parsed.imports:
-                target_path = resolve_internal_dependency(
-                    imp.module_name, source_relative, list(file_id_map.keys())
-                )
+            for imp in imports:
+                target_path = resolve_internal_dependency(imp.module_name, source_path, all_paths)
                 target_id = file_id_map.get(target_path) if target_path else None
 
                 dep = ImportDependency(
