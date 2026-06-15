@@ -4,8 +4,9 @@ using OpenAI text-embedding-3-small. Chunks at function/class boundary.
 """
 import chromadb
 from chromadb.utils import embedding_functions
+
 from app.core.config import get_settings
-from app.services.ast_parser import ParsedSymbol
+from app.services.parsers.base import ParsedSymbol
 
 settings = get_settings()
 
@@ -29,12 +30,20 @@ def get_collection(client: chromadb.PersistentClient):
 
 
 def build_document_text(symbol: ParsedSymbol, file_path: str) -> str:
+    """
+    Construct a rich text document for embedding.
+    Combines qualified name, docstring, and source so semantic search
+    finds both intent (docstring) and implementation (code).
+
+    Truncated to stay safely under the 8192-token limit for
+    text-embedding-3-small (roughly 4 chars/token, so ~6000 chars
+    leaves comfortable headroom).
+    """
     parts = [f"# {symbol.qualified_name} ({symbol.kind}) in {file_path}"]
     if symbol.docstring:
         parts.append(f"# Docstring: {symbol.docstring}")
     parts.append(symbol.source_code)
     text = "\n".join(parts)
-    # Truncate to ~6000 chars to stay safely under 8192 token limit
     return text[:6000]
 
 

@@ -1,6 +1,13 @@
 """
 Celery task: orchestrates the full repo ingestion pipeline.
 Publishes progress events to Redis for WebSocket streaming.
+
+Supports any file type the parser dispatcher knows about:
+  - Python: full AST symbol + import extraction
+  - JS/TS/TSX: tree-sitter symbol + import extraction
+  - Everything else: recorded as a graph node + embedded as a single
+    "module" chunk for semantic search, but with no extracted symbols
+    or import edges.
 """
 import json
 
@@ -10,11 +17,12 @@ from app.core.celery_app import celery_app
 from app.core.config import get_settings
 from app.core.database import SessionLocal
 from app.core.redis_client import get_redis_client
-from app.models.models import Repository, CodeFile, CodeSymbol, ImportDependency, IngestionStatus, SymbolKind
-from app.services.ast_parser import PythonASTParser, RepoWalker
-from app.services.github_service import clone_repo
+from app.models.models import CodeFile, CodeSymbol, ImportDependency, IngestionStatus, Repository, SymbolKind
+from app.services.dependency_resolver import resolve_dependency
 from app.services.embedding_service import embed_symbols
-from app.services.dependency_resolver import resolve_internal_dependency
+from app.services.github_service import clone_repo
+from app.services.parsers.dispatcher import parse_file
+from app.services.parsers.repo_walker import RepoWalker
 
 settings = get_settings()
 
@@ -23,6 +31,14 @@ def publish_progress(redis_client, repo_id: str, stage: str, message: str, pct: 
     """Push a progress event to Redis so the WebSocket handler can forward it."""
     payload = json.dumps({"stage": stage, "message": message, "percent": pct})
     redis_client.publish(f"ingestion:{repo_id}", payload)
+
+
+SYMBOL_KIND_MAP = {
+    "function": SymbolKind.FUNCTION,
+    "class": SymbolKind.CLASS,
+    "method": SymbolKind.METHOD,
+    "module": SymbolKind.MODULE,
+}
 
 
 @celery_app.task(bind=True, name="tasks.ingest_repository")
@@ -53,20 +69,19 @@ def ingest_repository(self, repository_id: str):
 
         walker = RepoWalker()
         file_paths = walker.walk(local_path)
-        progress("parsing", f"Found {len(file_paths)} source files, parsing AST…", 25)
+        progress("parsing", f"Found {len(file_paths)} source files, parsing…", 25)
 
-        parser = PythonASTParser()
         all_symbols_with_paths = []   # (ParsedSymbol, normalized_path, CodeFile.id)
         file_id_map = {}              # normalized_path (forward slashes) -> CodeFile.id
         file_imports_map = {}         # normalized_path -> list[ParsedImport]
+        file_language_map = {}        # normalized_path -> language label
 
         for i, fp in enumerate(file_paths):
-            parsed = parser.parse(fp, local_path)
+            parsed = parse_file(fp, local_path)
             if parsed.error:
                 continue
 
-            # Normalize to forward slashes so import resolution works
-            # consistently on Windows (os.path.relpath uses backslashes there).
+            # parse_file already normalizes to forward slashes, but be defensive
             normalized_path = parsed.path.replace("\\", "/")
 
             cf = CodeFile(
@@ -80,16 +95,15 @@ def ingest_repository(self, repository_id: str):
             db.flush()  # get cf.id without full commit
             file_id_map[normalized_path] = cf.id
             file_imports_map[normalized_path] = parsed.imports
+            file_language_map[normalized_path] = parsed.language
 
             for sym in parsed.symbols:
-                kind_map = {"function": SymbolKind.FUNCTION, "class": SymbolKind.CLASS,
-                            "method": SymbolKind.METHOD, "module": SymbolKind.MODULE}
                 cs = CodeSymbol(
                     repository_id=repository_id,
                     file_id=cf.id,
                     name=sym.name,
                     qualified_name=sym.qualified_name,
-                    kind=kind_map.get(sym.kind, SymbolKind.FUNCTION),
+                    kind=SYMBOL_KIND_MAP.get(sym.kind, SymbolKind.FUNCTION),
                     line_start=sym.line_start,
                     line_end=sym.line_end,
                     docstring=sym.docstring,
@@ -114,9 +128,10 @@ def ingest_repository(self, repository_id: str):
             source_id = file_id_map.get(source_path)
             if not source_id:
                 continue
+            language = file_language_map.get(source_path, "unknown")
 
             for imp in imports:
-                target_path = resolve_internal_dependency(imp.module_name, source_path, all_paths)
+                target_path = resolve_dependency(imp.module_name, source_path, all_paths, language)
                 target_id = file_id_map.get(target_path) if target_path else None
 
                 dep = ImportDependency(

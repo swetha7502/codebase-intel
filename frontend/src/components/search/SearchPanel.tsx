@@ -11,6 +11,20 @@ const KIND_ICON: Record<string, React.ReactNode> = {
   class: <Boxes size={12} className="text-emerald-400" />,
 }
 
+// Maps file extensions to Monaco's built-in language IDs so the code
+// viewer gets correct syntax highlighting for Python and JS/TS/TSX files.
+const EXT_TO_MONACO_LANG: Record<string, string> = {
+  py: 'python',
+  js: 'javascript', jsx: 'javascript', mjs: 'javascript', cjs: 'javascript',
+  ts: 'typescript', tsx: 'typescript',
+}
+
+function monacoLanguageFor(filePath: string): string {
+  const fileName = filePath.split('/').pop() ?? ''
+  const ext = fileName.includes('.') ? fileName.split('.').pop()?.toLowerCase() : undefined
+  return (ext && EXT_TO_MONACO_LANG[ext]) || 'plaintext'
+}
+
 export function SearchPanel({ repoId }: Props) {
   const [query, setQuery] = useState('')
   const [kind, setKind] = useState('')
@@ -112,7 +126,7 @@ export function SearchPanel({ repoId }: Props) {
               </div>
               <MonacoEditor
                 height="460px"
-                language="python"
+                language={monacoLanguageFor(selected.file_path)}
                 value={selected.snippet}
                 theme="vs-dark"
                 options={{

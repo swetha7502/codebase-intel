@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState } from 'react'
 import ReactFlow, {
   Node, Edge, Controls, MiniMap, Background,
   useNodesState, useEdgesState, MarkerType,
@@ -14,6 +14,7 @@ const LANG_COLORS: Record<string, string> = {
   python: '#3b82f6',
   javascript: '#f59e0b',
   typescript: '#06b6d4',
+  tsx: '#22d3ee',
   unknown: '#6b7280',
 }
 
@@ -70,6 +71,7 @@ export function DependencyGraphView({ repoId }: Props) {
   const [edges, setEdges, onEdgesChange] = useEdgesState([])
   const [loading, setLoading] = useState(true)
   const [stats, setStats] = useState({ nodes: 0, edges: 0 })
+  const [languages, setLanguages] = useState<string[]>([])
 
   useEffect(() => {
     reposApi.graph(repoId).then(res => {
@@ -77,6 +79,12 @@ export function DependencyGraphView({ repoId }: Props) {
       setNodes(n)
       setEdges(e)
       setStats({ nodes: res.data.nodes.length, edges: res.data.edges.length })
+
+      const langSet = new Set<string>()
+      res.data.nodes.forEach(node => {
+        if (node.language && node.language !== 'unknown') langSet.add(node.language)
+      })
+      setLanguages(Array.from(langSet).sort())
     }).finally(() => setLoading(false))
   }, [repoId])
 
@@ -90,12 +98,12 @@ export function DependencyGraphView({ repoId }: Props) {
 
   return (
     <div className="space-y-3">
-      <div className="flex items-center gap-4 text-xs text-slate-500">
+      <div className="flex items-center gap-4 text-xs text-slate-500 flex-wrap">
         <span>{stats.nodes} files</span>
         <span>{stats.edges} internal imports</span>
-        {Object.entries(LANG_COLORS).filter(([k]) => k !== 'unknown').map(([lang, color]) => (
+        {languages.map(lang => (
           <span key={lang} className="flex items-center gap-1">
-            <span className="w-2 h-2 rounded-full" style={{ background: color }} />
+            <span className="w-2 h-2 rounded-full" style={{ background: LANG_COLORS[lang] ?? LANG_COLORS.unknown }} />
             {lang}
           </span>
         ))}

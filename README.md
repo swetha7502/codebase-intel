@@ -1,103 +1,47 @@
-# Codebase Intel
+# Codebase Intel — Multi-language (Python + JS/TS/JSX/TSX) update
 
-A codebase intelligence platform that indexes GitHub repositories, builds dependency graphs, and lets you explore and ask questions about unfamiliar code.
+This zip contains ONLY the new/changed files. The folder structure
+mirrors your project root — extract and copy these into
+C:\Users\Swetha\Desktop\codebase-intel, overwriting existing files.
 
-## What it does
+## NEW files (create these):
+- backend/app/services/parsers/__init__.py        (empty)
+- backend/app/services/parsers/base.py
+- backend/app/services/parsers/python_parser.py
+- backend/app/services/parsers/treesitter_parser.py
+- backend/app/services/parsers/dispatcher.py
+- backend/app/services/parsers/repo_walker.py
+- backend/tests/test_multilang_parser.py
 
-1. **Ingests** a GitHub repo via the GitHub API (shallow clone for speed)
-2. **Parses** every Python/JS/TS file using Python's `ast` module — extracts functions, classes, methods, and imports at the symbol level
-3. **Builds a dependency graph** in PostgreSQL using recursive CTEs to traverse module relationships
-4. **Embeds** all symbols into ChromaDB via `text-embedding-3-small`, chunked at function/class boundaries (not character count)
-5. **Streams progress** in real time via WebSockets backed by Redis pub/sub
-6. **Exposes** a versioned FastAPI REST API with pagination, filtering, and rate-limiting
-7. **Frontend**: React + Vite + React Flow graph visualizer + Monaco editor + LangChain Q&A
+## MODIFIED files (overwrite existing):
+- backend/app/services/ast_parser.py        -> now a backward-compat shim
+- backend/app/services/dependency_resolver.py -> adds JS/TS import resolution
+- backend/app/services/embedding_service.py -> 1-line import path fix
+- backend/app/tasks/ingestion.py            -> uses new multi-language dispatcher
+- backend/app/main.py                       -> fixes pre-existing `settings` bug
+- backend/requirements.txt                  -> adds tree-sitter deps
+- frontend/src/components/graph/DependencyGraphView.tsx -> language colors/legend
+- frontend/src/components/search/SearchPanel.tsx        -> dynamic Monaco language
 
-## Architecture
+## Setup steps after copying files:
 
-```
-Frontend (React + Vite)
-    ↓ REST + WebSocket
-FastAPI (app/main.py)
-    ├── POST /api/v1/repositories      → fires Celery task
-    ├── GET  /api/v1/repositories/:id/graph    → PostgreSQL recursive CTE
-    ├── GET  /api/v1/repositories/:id/search   → ChromaDB semantic search
-    ├── POST /api/v1/repositories/:id/qa       → LangChain RAG
-    └── WS   /ws/ingestion/:id                 → Redis pub/sub → live progress
+1. Activate your venv:
+   venv\Scripts\activate
 
-Celery Worker
-    ├── Clone repo (GitPython)
-    ├── Walk file tree (RepoWalker)
-    ├── Parse AST (PythonASTParser)
-    ├── Build dependency graph (PostgreSQL + ImportDependency table)
-    └── Embed symbols (ChromaDB + OpenAI text-embedding-3-small)
+2. Install new dependencies:
+   pip install -r requirements.txt
+   (adds tree-sitter==0.21.3 and tree-sitter-languages==1.10.2 — pinned
+   together on purpose, newer tree-sitter breaks tree-sitter-languages)
 
-PostgreSQL
-    ├── repositories
-    ├── code_files
-    ├── code_symbols        ← functions, classes, methods
-    └── import_dependencies ← directed edges for dependency graph
+3. Restart your backend + Celery worker.
 
-Redis
-    └── Celery broker + result backend + pub/sub progress channel
+4. Delete and re-ingest a repo that has a TS/TSX frontend (e.g. your
+   Medical Research Agent repo) — you should now see .tsx/.ts/.js files
+   as nodes in the dependency graph, with edges for relative imports
+   (./components/Button) and @/ alias imports (@/lib/api).
 
-ChromaDB
-    └── code_symbols collection (embeddings + metadata)
-```
-
-## Setup
-
-### Prerequisites
-- Python 3.11+
-- Node 20+
-- PostgreSQL running locally
-- Redis running locally (`redis-server`)
-- OpenAI API key
-
-### Backend
-
-```bash
-cd backend
-
-# Windows
-python -m venv venv
-venv\Scripts\activate
-
-# Mac/Linux
-python -m venv venv
-source venv/bin/activate
-
-pip install -r requirements.txt
-
-cp .env.example .env
-# Fill in DATABASE_URL, REDIS_URL, OPENAI_API_KEY, GITHUB_TOKEN
-
-# Create DB
-createdb codebase_intel
-
-# Run API server
-uvicorn app.main:app --reload --port 8000
-
-# In a separate terminal (same venv):
-celery -A app.core.celery_app worker --loglevel=info
-```
-
-### Frontend
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-Open `http://localhost:5173`. API docs at `http://localhost:8000/api/docs`.
-
-## Resume talking points
-
-- Built an AST-based ingestion pipeline using Python's `ast` module to extract function/class/method symbols with line-level precision — chunked at semantic boundaries instead of character count for more meaningful embeddings
-- Modeled module relationships as a directed graph in PostgreSQL using a recursive CTE to traverse import chains; exposed via a React Flow visualization
-- Designed a Celery + Redis async job queue for long-running repo ingestion, with real-time progress streaming to the frontend via WebSockets and Redis pub/sub
-- Implemented function-level semantic search over embedded codebases using ChromaDB and LangChain RAG with `gpt-4o-mini`, with a versioned FastAPI backend supporting multi-repo isolation, pagination, and kind/file filtering
-
-## Interview story
-
-> "At Oracle I wrote KT docs and ran onboarding sessions for every major release — I knew exactly how much time engineers waste trying to understand an unfamiliar codebase. The interesting engineering problem here wasn't the AI layer — it was building a proper data pipeline: parsing code at the AST level rather than by character count, modeling import relationships as graph edges in PostgreSQL so I could run recursive queries like 'what depends on this module', and making the ingestion async so a large repo doesn't time out the HTTP request."
+5. Run tests to confirm everything's wired up:
+   cd backend
+   pytest tests/ -q
+   ruff check app tests --config ruff.toml
+   (should show 19 passed, "All checks passed!")
