@@ -1,32 +1,27 @@
 """
-Embedding service: indexes parsed code symbols into ChromaDB
-using OpenAI text-embedding-3-small. Chunks at function/class boundary.
+Embedding service: generates OpenAI embeddings and stores them as pgvector
+vectors directly in the code_symbols table in Supabase/PostgreSQL.
+
+Replaces the previous ChromaDB-based implementation. pgvector is shared
+between the API and Celery worker (same Supabase DB), so embeddings
+generated during ingestion are immediately available for search — no local
+disk state, fully compatible with stateless Cloud Run containers.
 """
-import chromadb
-from chromadb.utils import embedding_functions
+import openai
+from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+from app.models.models import CodeSymbol
 from app.services.parsers.base import ParsedSymbol
 
 settings = get_settings()
 
-COLLECTION_NAME = "code_symbols"
+EMBEDDING_MODEL = "text-embedding-3-small"
+EMBEDDING_DIMS = 1536
 
 
-def get_chroma_client() -> chromadb.PersistentClient:
-    return chromadb.PersistentClient(path=settings.chroma_persist_dir)
-
-
-def get_collection(client: chromadb.PersistentClient):
-    ef = embedding_functions.OpenAIEmbeddingFunction(
-        api_key=settings.openai_api_key,
-        model_name="text-embedding-3-small",
-    )
-    return client.get_or_create_collection(
-        name=COLLECTION_NAME,
-        embedding_function=ef,
-        metadata={"hnsw:space": "cosine"},
-    )
+def _get_openai_client() -> openai.OpenAI:
+    return openai.OpenAI(api_key=settings.openai_api_key)
 
 
 def build_document_text(symbol: ParsedSymbol, file_path: str) -> str:
@@ -34,100 +29,93 @@ def build_document_text(symbol: ParsedSymbol, file_path: str) -> str:
     Construct a rich text document for embedding.
     Combines qualified name, docstring, and source so semantic search
     finds both intent (docstring) and implementation (code).
-
     Truncated to stay safely under the 8192-token limit for
-    text-embedding-3-small (roughly 4 chars/token, so ~6000 chars
-    leaves comfortable headroom).
+    text-embedding-3-small (roughly 4 chars/token → ~6000 chars).
     """
     parts = [f"# {symbol.qualified_name} ({symbol.kind}) in {file_path}"]
     if symbol.docstring:
         parts.append(f"# Docstring: {symbol.docstring}")
     parts.append(symbol.source_code)
-    text = "\n".join(parts)
-    return text[:6000]
+    return "\n".join(parts)[:6000]
 
 
 def embed_symbols(
     repository_id: str,
-    symbols_with_paths: list[tuple[ParsedSymbol, str]],  # (symbol, file_path)
+    symbols_with_paths: list[tuple[ParsedSymbol, str]],
+    db: Session,
     batch_size: int = 100,
-) -> dict[str, str]:
+) -> None:
     """
-    Embeds a list of symbols into ChromaDB.
-    Returns a mapping of qualified_name -> chroma_id.
-    """
-    client = get_chroma_client()
-    collection = get_collection(client)
+    Generates embeddings for all symbols and writes them to the
+    code_symbols.embedding column in PostgreSQL via pgvector.
 
-    id_map = {}
+    The DB session is passed in from the Celery task so we reuse the
+    same transaction and avoid opening extra connections.
+    """
+    client = _get_openai_client()
 
     for i in range(0, len(symbols_with_paths), batch_size):
         batch = symbols_with_paths[i:i + batch_size]
-        ids, documents, metadatas = [], [], []
+        texts = [build_document_text(sym, path) for sym, path in batch]
 
-        for symbol, file_path in batch:
-            chroma_id = f"{repository_id}::{file_path}::{symbol.qualified_name}::{symbol.line_start}"
-            doc_text = build_document_text(symbol, file_path)
+        response = client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
+        vectors = [item.embedding for item in response.data]
 
-            ids.append(chroma_id)
-            documents.append(doc_text)
-            metadatas.append({
-                "repository_id": repository_id,
-                "file_path": file_path,
-                "symbol_name": symbol.name,
-                "qualified_name": symbol.qualified_name,
-                "kind": symbol.kind,
-                "line_start": symbol.line_start,
-                "line_end": symbol.line_end,
-            })
-            id_map[symbol.qualified_name] = chroma_id
+        for (symbol, file_path), vector in zip(batch, vectors):
+            db.query(CodeSymbol).filter(
+                CodeSymbol.repository_id == repository_id,
+                CodeSymbol.qualified_name == symbol.qualified_name,
+            ).update({"embedding": vector}, synchronize_session=False)
 
-        collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
-
-    return id_map
+    db.commit()
 
 
 def search_symbols(
     repository_id: str,
     query: str,
+    db: Session,
     n_results: int = 10,
     kind_filter: str | None = None,
-    file_filter: str | None = None,
 ) -> list[dict]:
     """
-    Semantic search over embedded code symbols.
-    Returns list of result dicts with metadata + distance.
+    Semantic search via pgvector cosine distance.
+    Returns list of result dicts matching the shape the API expects.
     """
-    client = get_chroma_client()
-    collection = get_collection(client)
+    client = _get_openai_client()
 
-    where = {"repository_id": repository_id}
+    response = client.embeddings.create(model=EMBEDDING_MODEL, input=[query])
+    query_vector = response.data[0].embedding
+
+    from sqlalchemy import func
+
+    q = db.query(
+        CodeSymbol,
+        CodeSymbol.embedding.cosine_distance(query_vector).label("distance"),
+    ).filter(
+        CodeSymbol.repository_id == repository_id,
+        CodeSymbol.embedding.isnot(None),
+    )
     if kind_filter:
-        where["kind"] = kind_filter
-    if file_filter:
-        where["file_path"] = {"$contains": file_filter}
+        q = q.filter(CodeSymbol.kind == kind_filter)
 
-    results = collection.query(
-        query_texts=[query],
-        n_results=n_results,
-        where=where if len(where) > 1 or "repository_id" in where else None,
-        include=["metadatas", "distances", "documents"],
+    results = (
+        q.order_by("distance")
+        .limit(n_results)
+        .all()
     )
 
     output = []
-    if results["ids"] and results["ids"][0]:
-        for idx, chroma_id in enumerate(results["ids"][0]):
-            output.append({
-                "chroma_id": chroma_id,
-                "metadata": results["metadatas"][0][idx],
-                "distance": results["distances"][0][idx],
-                "document": results["documents"][0][idx],
-            })
+    for symbol, distance in results:
+        output.append({
+            "symbol": symbol,
+            "distance": float(distance),
+        })
     return output
 
 
-def delete_repo_embeddings(repository_id: str):
-    """Remove all embeddings for a repo when it's deleted."""
-    client = get_chroma_client()
-    collection = get_collection(client)
-    collection.delete(where={"repository_id": repository_id})
+def delete_repo_embeddings(repository_id: str, db: Session) -> None:
+    """Null out embeddings for a repo (rows are deleted via CASCADE on repo delete)."""
+    db.query(CodeSymbol).filter(
+        CodeSymbol.repository_id == repository_id,
+    ).update({"embedding": None}, synchronize_session=False)
+    db.commit()

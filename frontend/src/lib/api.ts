@@ -7,13 +7,15 @@ export interface Repo {
   github_url: string
   owner: string
   name: string
-  description: string | null
-  language: string | null
+  default_branch: string
+  description?: string | null
+  language?: string | null
   star_count: number
-  status: 'pending' | 'cloning' | 'parsing' | 'embedding' | 'complete' | 'failed'
+  status: string
   file_count: number
   function_count: number
   class_count: number
+  error_message?: string | null
   created_at: string
   updated_at: string
 }

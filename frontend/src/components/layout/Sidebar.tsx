@@ -16,7 +16,7 @@ const STATUS_ICON = {
   cloning: <Loader2 size={12} className="text-blue-400 animate-spin" />,
   parsing: <Loader2 size={12} className="text-amber-400 animate-spin" />,
   embedding: <Loader2 size={12} className="text-brand-400 animate-spin" />,
-}
+} as Record<string, React.ReactNode>
 
 export function Sidebar({ repos, onRepoAdded, onRepoDeleted }: SidebarProps) {
   const [adding, setAdding] = useState(false)

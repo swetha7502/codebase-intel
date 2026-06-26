@@ -1,12 +1,12 @@
 """
-RAG-based Q&A over an indexed codebase using LangChain + ChromaDB.
+RAG-based Q&A over an indexed codebase using LangChain + pgvector.
 """
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_community.vectorstores import Chroma
-from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
+from langchain_openai import ChatOpenAI
 
 from app.core.config import get_settings
+from app.core.database import SessionLocal
+from app.services.embedding_service import search_symbols
 
 settings = get_settings()
 
@@ -27,51 +27,52 @@ Answer:"""
 )
 
 
-def get_qa_chain(repository_id: str) -> RetrievalQA:
-    embeddings = OpenAIEmbeddings(
-        model="text-embedding-3-small",
-        openai_api_key=settings.openai_api_key,
-    )
-    vectorstore = Chroma(
-        persist_directory=settings.chroma_persist_dir,
-        embedding_function=embeddings,
-        collection_name="code_symbols",
-    )
-    retriever = vectorstore.as_retriever(
-        search_kwargs={
-            "k": 8,
-            "filter": {"repository_id": repository_id},
-        }
-    )
-    llm = ChatOpenAI(
-        model="gpt-4o-mini",
-        temperature=0,
-        openai_api_key=settings.openai_api_key,
-    )
-    return RetrievalQA.from_chain_type(
-        llm=llm,
-        retriever=retriever,
-        chain_type="stuff",
-        chain_type_kwargs={"prompt": SYSTEM_PROMPT},
-        return_source_documents=True,
-    )
-
-
 def answer_question(repository_id: str, question: str) -> dict:
-    chain = get_qa_chain(repository_id)
-    result = chain.invoke({"query": question})
+    db = SessionLocal()
+    try:
+        raw_results = search_symbols(
+            repository_id=repository_id,
+            query=question,
+            db=db,
+            n_results=8,
+        )
 
-    sources = []
-    for doc in result.get("source_documents", []):
-        meta = doc.metadata
-        sources.append({
-            "file_path": meta.get("file_path"),
-            "qualified_name": meta.get("qualified_name"),
-            "kind": meta.get("kind"),
-            "line_start": meta.get("line_start"),
-        })
+        # Build context string from top results
+        context_parts = []
+        sources = []
+        for r in raw_results:
+            symbol = r["symbol"]
+            db_file = db.query(__import__(
+                "app.models.models", fromlist=["CodeFile"]
+            ).CodeFile).filter_by(id=symbol.file_id).first()
+            file_path = db_file.path if db_file else "unknown"
 
-    return {
-        "answer": result["result"],
-        "sources": sources,
-    }
+            context_parts.append(
+                f"# {symbol.qualified_name} ({symbol.kind}) in {file_path} "
+                f"(lines {symbol.line_start}–{symbol.line_end})\n"
+                f"{symbol.source_code or ''}"
+            )
+            sources.append({
+                "file_path": file_path,
+                "qualified_name": symbol.qualified_name,
+                "kind": symbol.kind.value if symbol.kind else None,
+                "line_start": symbol.line_start,
+            })
+
+        context = "\n\n---\n\n".join(context_parts)
+
+        llm = ChatOpenAI(
+            model="gpt-4o-mini",
+            temperature=0,
+            openai_api_key=settings.openai_api_key,
+        )
+
+        prompt = SYSTEM_PROMPT.format(context=context, question=question)
+        response = llm.invoke(prompt)
+
+        return {
+            "answer": response.content,
+            "sources": sources,
+        }
+    finally:
+        db.close()

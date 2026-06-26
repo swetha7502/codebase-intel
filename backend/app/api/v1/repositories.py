@@ -2,17 +2,22 @@
 /api/v1/repositories — CRUD + ingestion trigger
 """
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.orm import Session
 from sqlalchemy import text
+from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.models.models import Repository, CodeFile, CodeSymbol, ImportDependency, IngestionStatus
+from app.models.models import CodeFile, CodeSymbol, ImportDependency, IngestionStatus, Repository
 from app.schemas.schemas import (
-    RepoCreate, RepoResponse, RepoListResponse,
-    DependencyGraph, GraphNode, GraphEdge,
-    SymbolResponse, SymbolListResponse,
+    DependencyGraph,
+    GraphEdge,
+    GraphNode,
+    RepoCreate,
+    RepoListResponse,
+    RepoResponse,
+    SymbolListResponse,
+    SymbolResponse,
 )
-from app.services.github_service import parse_github_url, fetch_repo_metadata
+from app.services.github_service import fetch_repo_metadata, parse_github_url
 from app.tasks.ingestion import ingest_repository
 
 router = APIRouter(prefix="/repositories", tags=["repositories"])
@@ -76,10 +81,9 @@ def delete_repository(repo_id: str, db: Session = Depends(get_db)):
     repo = db.query(Repository).filter(Repository.id == repo_id).first()
     if not repo:
         raise HTTPException(status_code=404, detail="Repository not found")
-    from app.services.embedding_service import delete_repo_embeddings
-    delete_repo_embeddings(repo_id)
     db.delete(repo)
     db.commit()
+    db.expunge_all()
 
 
 @router.post("/{repo_id}/reindex", response_model=RepoResponse)
@@ -89,14 +93,11 @@ def reindex_repository(repo_id: str, db: Session = Depends(get_db)):
     if not repo:
         raise HTTPException(status_code=404, detail="Repository not found")
 
-    # Clear existing data
+    # Clear existing data (embeddings are stored on CodeSymbol rows, deleted via cascade)
     db.query(ImportDependency).filter(ImportDependency.repository_id == repo_id).delete()
     db.query(CodeSymbol).filter(CodeSymbol.repository_id == repo_id).delete()
     db.query(CodeFile).filter(CodeFile.repository_id == repo_id).delete()
     db.commit()
-
-    from app.services.embedding_service import delete_repo_embeddings
-    delete_repo_embeddings(repo_id)
 
     repo.status = IngestionStatus.PENDING
     repo.error_message = None
@@ -161,7 +162,6 @@ def get_dependency_graph(repo_id: str, db: Session = Depends(get_db)):
     edges_rows = db.execute(edges_q, {"repo_id": repo_id}).fetchall()
 
     # Build file_path -> node_id map for edge wiring
-    path_to_node_id = {str(row.id): str(row.id) for row in files}
     path_map = {row.path: str(row.id) for row in files}
 
     edges = [

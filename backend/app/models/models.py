@@ -1,12 +1,12 @@
+import enum
 import uuid
 from datetime import datetime
-from sqlalchemy import (
-    Column, String, Text, Integer, DateTime, ForeignKey,
-    Boolean, Enum as SAEnum, UniqueConstraint, Index
-)
+
+from pgvector.sqlalchemy import Vector
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Enum as SAEnum
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import relationship
-from sqlalchemy.dialects.postgresql import UUID, JSONB
-import enum
 
 from app.core.database import Base
 
@@ -53,7 +53,7 @@ class CodeFile(Base):
 
     id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
     repository_id = Column(UUID(as_uuid=False), ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False)
-    path = Column(String(1000), nullable=False)           # relative path within repo
+    path = Column(String(1000), nullable=False)
     language = Column(String(50), nullable=True)
     size_bytes = Column(Integer, default=0)
     line_count = Column(Integer, default=0)
@@ -78,21 +78,22 @@ class SymbolKind(str, enum.Enum):
 
 
 class CodeSymbol(Base):
-    """A function, class, or method extracted by the AST parser."""
+    """A function, class, or method extracted by the AST/tree-sitter parser."""
     __tablename__ = "code_symbols"
 
     id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
     repository_id = Column(UUID(as_uuid=False), ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False)
     file_id = Column(UUID(as_uuid=False), ForeignKey("code_files.id", ondelete="CASCADE"), nullable=False)
     name = Column(String(500), nullable=False)
-    qualified_name = Column(String(1000), nullable=True)   # e.g. MyClass.my_method
+    qualified_name = Column(String(1000), nullable=True)
     kind = Column(SAEnum(SymbolKind), nullable=False)
     line_start = Column(Integer, nullable=True)
     line_end = Column(Integer, nullable=True)
     docstring = Column(Text, nullable=True)
     source_code = Column(Text, nullable=True)
-    chroma_id = Column(String(500), nullable=True)         # reference to ChromaDB embedding
-    extra = Column(JSONB, default={})                      # args, decorators, etc.
+    # pgvector embedding column: 1536 dims = text-embedding-3-small output size
+    embedding = Column(Vector(1536), nullable=True)
+    extra = Column(JSONB, default={})
     created_at = Column(DateTime, default=datetime.utcnow)
 
     repository = relationship("Repository", back_populates="symbols")
@@ -116,9 +117,9 @@ class ImportDependency(Base):
     repository_id = Column(UUID(as_uuid=False), ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False)
     source_file_id = Column(UUID(as_uuid=False), ForeignKey("code_files.id", ondelete="CASCADE"), nullable=False)
     target_file_id = Column(UUID(as_uuid=False), ForeignKey("code_files.id", ondelete="CASCADE"), nullable=True)
-    import_statement = Column(String(500), nullable=False)  # raw import string
-    module_name = Column(String(500), nullable=False)        # resolved module name
-    is_internal = Column(Boolean, default=False)             # True if it resolves to a file in the repo
+    import_statement = Column(String(500), nullable=False)
+    module_name = Column(String(500), nullable=False)
+    is_internal = Column(Boolean, default=False)
 
     source_file = relationship("CodeFile", foreign_keys=[source_file_id], back_populates="imports")
     target_file = relationship("CodeFile", foreign_keys=[target_file_id])

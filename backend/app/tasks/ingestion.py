@@ -153,19 +153,8 @@ def ingest_repository(self, repository_id: str):
         progress("embedding", f"Embedding {len(all_symbols_with_paths)} symbols…", 65)
 
         sym_path_pairs = [(s, p) for s, p, _ in all_symbols_with_paths]
-        id_map = embed_symbols(repository_id, sym_path_pairs)
+        embed_symbols(repository_id, sym_path_pairs, db)
 
-        # Write chroma_ids back to DB
-        for sym, path, file_id in all_symbols_with_paths:
-            chroma_id = id_map.get(sym.qualified_name)
-            if chroma_id:
-                db.query(CodeSymbol).filter(
-                    CodeSymbol.repository_id == repository_id,
-                    CodeSymbol.qualified_name == sym.qualified_name,
-                    CodeSymbol.file_id == file_id,
-                ).update({"chroma_id": chroma_id})
-
-        db.commit()
         progress("embedding", "Embeddings stored", 90)
 
         # ── Stage 5: Finalize ─────────────────────────────────────────────
