@@ -2,7 +2,6 @@
 WebSocket endpoint: streams real-time ingestion progress to the frontend.
 Subscribes to Redis pub/sub channel for the given repository.
 """
-import asyncio
 import json
 import redis.asyncio as aioredis
 

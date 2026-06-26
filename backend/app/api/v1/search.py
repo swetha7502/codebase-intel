@@ -40,7 +40,7 @@ def semantic_search(
         file_path = file.path if file else ""
 
         # Snippet: first 10 non-empty lines of source
-        snippet_lines = [l for l in (symbol.source_code or "").split("\n") if l.strip()]
+        snippet_lines = [line for line in (symbol.source_code or "").split("\n") if line.strip()]
         snippet = "\n".join(snippet_lines[:10])[:400]
 
         results.append(SearchResult(
