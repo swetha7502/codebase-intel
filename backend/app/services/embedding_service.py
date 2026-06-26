@@ -86,8 +86,6 @@ def search_symbols(
     response = client.embeddings.create(model=EMBEDDING_MODEL, input=[query])
     query_vector = response.data[0].embedding
 
-    from sqlalchemy import func
-
     q = db.query(
         CodeSymbol,
         CodeSymbol.embedding.cosine_distance(query_vector).label("distance"),
