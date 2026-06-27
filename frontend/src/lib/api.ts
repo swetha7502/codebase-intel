@@ -1,6 +1,5 @@
 import axios from 'axios'
-
-export const api = axios.create({ baseURL: '/api/v1' })
+export const api = axios.create({ baseURL: `${import.meta.env.VITE_API_URL}/v1` })
 
 export interface Repo {
   id: string
