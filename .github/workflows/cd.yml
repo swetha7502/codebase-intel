@@ -75,6 +75,7 @@ jobs:
           docker build \
             --build-arg VITE_API_URL=${API_URL}/api \
             --build-arg VITE_WS_URL=${API_URL/https/wss} \
+            --build-arg API_URL=${API_URL} \
             -t ${IMAGE} \
             ./frontend
 
