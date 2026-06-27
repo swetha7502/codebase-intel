@@ -33,11 +33,6 @@ jobs:
           docker build -t ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/api:${{ github.sha }} ./backend
           docker push ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/api:${{ github.sha }}
 
-      - name: Build and push frontend image
-        run: |
-          docker build -t ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/frontend:${{ github.sha }} ./frontend
-          docker push ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/frontend:${{ github.sha }}
-
       - name: Deploy API to Cloud Run
         run: |
           gcloud run deploy codebase-intel-api \
@@ -69,29 +64,29 @@ jobs:
             --port 8080 \
             --no-cpu-throttling
 
-      - name: Get API URL
+      - name: Build, push, and deploy frontend to Cloud Run
         run: |
-          API_URL=$(gcloud run services describe codebase-intel-api --region ${{ env.REGION }} --format 'value(status.url)')
-          echo "API URL: $API_URL"
+          API_URL=$(gcloud run services describe codebase-intel-api \
+            --region ${{ env.REGION }} \
+            --format 'value(status.url)')
 
-      - name: Deploy frontend to Cloud Run
-        run: |
-          API_URL=$(gcloud run services describe codebase-intel-api --region ${{ env.REGION }} --format 'value(status.url)')
+          IMAGE="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/frontend:${{ github.sha }}"
+
           docker build \
             --build-arg VITE_API_URL=${API_URL}/api \
             --build-arg VITE_WS_URL=${API_URL/https/wss} \
-            -t ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/frontend:${{ github.sha }} \
+            -t ${IMAGE} \
             ./frontend
-          docker push ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/frontend:${{ github.sha }}
-          gcloud run deploy codebase-intel-frontend \
-          --image ... \
-          --region ${{ env.REGION }} \
-          --platform managed \
-          --allow-unauthenticated \
-          --memory 512Mi \
-          --cpu 1 \
-          --min-instances 0 \
-          --max-instances 3 \
-          --port 8080
 
-            
+          docker push ${IMAGE}
+
+          gcloud run deploy codebase-intel-frontend \
+            --image ${IMAGE} \
+            --region ${{ env.REGION }} \
+            --platform managed \
+            --allow-unauthenticated \
+            --memory 512Mi \
+            --cpu 1 \
+            --min-instances 0 \
+            --max-instances 3 \
+            --port 8080
