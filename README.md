@@ -1,99 +1,103 @@
 # Codebase Intel
 
-A codebase intelligence platform that indexes GitHub repositories, builds dependency graphs, and lets you explore and ask questions about unfamiliar code — across both Python and JavaScript/TypeScript codebases.
+An AI-powered code exploration tool for understanding large repositories. Point it at any public GitHub repo and get an interactive dependency graph, semantic symbol search, and a Q&A interface over the entire codebase.
+
+**Live demo:** https://codebase-intel-frontend-kteuihegea-uc.a.run.app
+
+---
 
 ## What it does
 
-1. **Ingests** a GitHub repo via the GitHub API (shallow clone for speed)
-2. **Parses** every Python and JS/TS/JSX/TSX file through a polyglot AST pipeline — Python's `ast` module for Python, tree-sitter for the frontend stack — extracting functions, classes, methods, and imports at the symbol level (not by character count)
-3. **Builds a dependency graph** in PostgreSQL using recursive CTEs to traverse module relationships, with language-aware import resolution (Python dotted modules vs. JS/TS relative paths and `@/` aliases)
-4. **Embeds** all symbols into ChromaDB via `text-embedding-3-small`, chunked at function/class/method boundaries
-5. **Streams progress** in real time via WebSockets backed by Redis pub/sub
-6. **Exposes** a versioned FastAPI REST API with pagination, filtering, and rate-limiting
-7. **Frontend**: React + Vite + React Flow graph visualizer + Monaco editor + LangChain Q&A
+- **Dependency graph** — Parses Python and JavaScript/TypeScript codebases and visualizes file-level import relationships as an interactive graph
+- **Semantic search** — Embed and index every function, class, and module using OpenAI embeddings stored in pgvector; search by meaning, not just keyword
+- **Q&A** — Ask natural language questions about the codebase and get answers grounded in the actual source code
+- **Multi-language parsing** — Python via the standard AST module; JS/TS/JSX/TSX via tree-sitter for accurate, fault-tolerant parsing
+
+---
 
 ## Architecture
 
 ```
-Frontend (React + Vite)
-    ↓ REST + WebSocket
-FastAPI (app/main.py)
-    ├── POST /api/v1/repositories      → fires Celery task
-    ├── GET  /api/v1/repositories/:id/graph    → PostgreSQL recursive CTE
-    ├── GET  /api/v1/repositories/:id/search   → ChromaDB semantic search
-    ├── POST /api/v1/repositories/:id/qa       → LangChain RAG
-    └── WS   /ws/ingestion/:id                 → Redis pub/sub → live progress
-
-Celery Worker
-    ├── Clone repo (GitPython)
-    ├── Walk file tree (RepoWalker)
-    ├── Parse source — dispatcher routes by extension:
-    │     ├── .py              → Python `ast` module
-    │     └── .js/.jsx/.ts/.tsx → tree-sitter (tree-sitter-languages)
-    ├── Resolve imports — language-aware:
-    │     ├── Python  → dotted module paths (agents.pipeline → agents/pipeline.py)
-    │     └── JS/TS   → relative (./components/Button) and @/ alias imports
-    ├── Build dependency graph (PostgreSQL + ImportDependency table)
-    └── Embed symbols (ChromaDB + OpenAI text-embedding-3-small)
-
-PostgreSQL
-    ├── repositories
-    ├── code_files
-    ├── code_symbols        ← functions, classes, methods (any supported language)
-    └── import_dependencies ← directed edges for dependency graph
-
-Redis
-    └── Celery broker + result backend + pub/sub progress channel
-
-ChromaDB
-    └── code_symbols collection (embeddings + metadata)
+GitHub URL
+    │
+    ▼
+FastAPI (Cloud Run)
+    │  enqueues job
+    ▼
+Celery Worker (Cloud Run) ──► Clones repo, parses files, builds graph
+    │                          Generates embeddings via OpenAI
+    │                          Stores symbols + vectors in Supabase (pgvector)
+    ▼
+React Frontend (Cloud Run)
+    │  dependency graph
+    │  semantic search
+    └► Q&A over codebase
 ```
 
-## Setup
+**Services:** Three independent Cloud Run services (API, worker, frontend) deployed via GitHub Actions on every push to main.
 
-### Prerequisites
-- Python 3.10+
-- Node 20+
-- PostgreSQL (Supabase or local)
-- Redis (Upstash or local)
-- OpenAI API key
+---
 
-### Backend
+## Tech stack
+
+| Layer | Technology |
+|---|---|
+| Frontend | React, Vite, TypeScript |
+| API | FastAPI, Python |
+| Worker | Celery |
+| Database | Supabase (PostgreSQL + pgvector) |
+| Cache / queue | Redis Cloud |
+| Parsers | Python AST, tree-sitter |
+| Embeddings | OpenAI `text-embedding-ada-002` |
+| Infrastructure | GCP Cloud Run, Artifact Registry |
+| CI/CD | GitHub Actions |
+
+---
+
+## Key engineering decisions
+
+**pgvector over ChromaDB**
+Started with ChromaDB for vector storage but migrated to pgvector on Supabase. This consolidates embeddings and relational data (repositories, symbols, jobs) into a single Postgres instance, eliminating a separate vector database dependency and simplifying the deployment surface. The tradeoff is slightly more complex queries (`ORDER BY embedding <=> $1`) versus ChromaDB's purpose-built API.
+
+**Redis Cloud over Upstash**
+Initially used Upstash for the Celery broker. Upstash drops idle connections after a period of inactivity, which caused Celery workers to silently fail on the first task after a quiet period. Switched to Redis Cloud free tier, which maintains persistent connections and behaves like a standard Redis instance.
+
+**Supabase session pooler for database connections**
+Direct Supabase connections use IPv6, which caused connectivity failures from Cloud Run. Switched to the Supabase session pooler endpoint (`aws-1-us-east-2.pooler.supabase.com`) which proxies over IPv4 and resolved the issue.
+
+**Parser scope: Python + JS/TS only**
+Deliberately scoped the multi-language parser to Python and JavaScript/TypeScript rather than attempting broad language support. This covers the most common full-stack project structures while keeping the parser layer maintainable. JSON, YAML, and Markdown files appear as nodes in the graph but are not parsed for symbols.
+
+**Three-service Cloud Run architecture**
+Separated the API, Celery worker, and frontend into independent Cloud Run services. This allows the worker to run with higher memory (`2Gi`) and `--no-cpu-throttling` for compute-intensive indexing jobs, while the API and frontend scale independently based on request volume.
+
+---
+
+## AI assistance disclosure
+
+Frontend UI/UX design and the system architecture diagram were developed with AI assistance. All backend engineering, infrastructure configuration, parser implementation, and deployment pipeline were written and debugged without AI generation.
+
+---
+
+## Local development
 
 ```bash
+# Clone the repo
+git clone https://github.com/swetha7502/codebase-intel
+cd codebase-intel
+
+# Backend
 cd backend
-
-# Windows
-python -m venv venv
-venv\Scripts\activate
-
-# Mac/Linux
-python -m venv venv
-source venv/bin/activate
-
 pip install -r requirements.txt
-
-cp .env.example .env
-# Fill in DATABASE_URL, REDIS_URL, OPENAI_API_KEY, GITHUB_TOKEN
-
-# Run API server
 uvicorn app.main:app --reload --port 8000
 
-# In a separate terminal (same venv):
-celery -A app.core.celery_app worker --loglevel=info --pool=solo   # --pool=solo on Windows
-```
+# Worker (separate terminal)
+celery -A app.core.celery_app worker --loglevel=info --concurrency=1
 
-### Frontend
-
-```bash
+# Frontend
 cd frontend
 npm install
 npm run dev
 ```
 
-Open `http://localhost:5173`. API docs at `http://localhost:8000/api/docs`.
-
-
-## Developer notes
-
-The frontend UI/UX design, README file and the architecture diagram above were developed with AI assistance (Claude). Everything else — the polyglot AST/tree-sitter parsing pipeline, language-aware dependency resolution, database schema, async ingestion architecture, and API design — was designed and implemented independently.
+Requires a `.env` file in `backend/` with `DATABASE_URL`, `REDIS_URL`, `OPENAI_API_KEY`, and `GH_PAT`.
